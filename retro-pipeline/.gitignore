@@ -1,0 +1,12 @@
+# outputs and temps
+tmp/
+output/
+*.mp4
+
+# secrets
+.env
+
+# python
+venv/
+__pycache__/
+*.pyc
