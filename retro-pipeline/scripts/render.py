@@ -10,6 +10,7 @@ from pathlib import Path
 
 import requests
 from dotenv import load_dotenv
+from PIL import Image
 
 # =========================
 # Config
@@ -30,9 +31,10 @@ SAFE_END_PADDING = 5
 DOWNLOAD_BUFFER = 10
 
 ROOT = Path(__file__).resolve().parents[1]
-GAMES_DIR = ROOT / "games"
-TMP_DIR = ROOT / "tmp"
-OUT_DIR = ROOT / "output"
+GAMES_DIR    = ROOT / "games"
+PLATFORMS_DIR = ROOT / "platforms"   # platforms/playstation_1.png, etc.
+TMP_DIR      = ROOT / "tmp"
+OUT_DIR      = ROOT / "output"
 
 # Fallback quando source.json não tem clip_starts
 DOWNLOAD_SECTION_START = "00:08:00"
@@ -40,7 +42,7 @@ DOWNLOAD_SECTION_END = "00:25:00"
 MAX_HEIGHT = 720
 
 load_dotenv(ROOT / ".env")
-RAWG_KEY = os.getenv("RAWG_KEY", "").strip()
+RAWG_KEY  = os.getenv("RAWG_KEY", "").strip()
 FONT_FILE = os.getenv("FONT_FILE", "").strip()
 
 
@@ -60,6 +62,7 @@ def sh(cmd):
 def ensure_dirs():
     TMP_DIR.mkdir(parents=True, exist_ok=True)
     OUT_DIR.mkdir(parents=True, exist_ok=True)
+    PLATFORMS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def human_size(num_bytes):
@@ -97,6 +100,109 @@ def ts_to_seconds(ts: str) -> int:
 def seconds_to_ts(s: int) -> str:
     """Converte segundos em 'HH:MM:SS'."""
     return f"{s//3600:02d}:{(s%3600)//60:02d}:{s%60:02d}"
+
+
+def download_image(url: str, dest: Path, force: bool = False) -> bool:
+    """Baixa uma imagem de uma URL para dest. Retorna True se bem-sucedido."""
+    if dest.exists() and dest.stat().st_size > 0 and not force:
+        print(f"[skip] imagem já existe: {dest.name}")
+        return True
+    try:
+        print(f"[img] baixando {dest.name} ← {url}")
+        r = requests.get(url, timeout=30, stream=True)
+        r.raise_for_status()
+        dest.write_bytes(r.content)
+        print_size(dest, "img")
+        return True
+    except Exception as e:
+        print(f"[img] falhou ao baixar {dest.name}: {e}")
+        return False
+
+
+# =========================
+# Remove fundo branco de imagens de console
+# =========================
+def remove_white_background(src: Path, dst: Path, threshold: int = 240) -> Path:
+    """
+    Converte pixels brancos/quase-brancos em transparentes.
+    Salva como PNG com canal alpha. Retorna dst.
+    """
+    img = Image.open(src).convert("RGBA")
+    data = img.getdata()
+    new_data = []
+    for r, g, b, a in data:
+        if r >= threshold and g >= threshold and b >= threshold:
+            new_data.append((r, g, b, 0))   # transparente
+        else:
+            new_data.append((r, g, b, a))
+    img.putdata(new_data)
+    img.save(dst, "PNG")
+    return dst
+
+
+# =========================
+# Assets: capa e console
+# =========================
+def resolve_cover(cfg: dict, slug: str, rawg_details: dict | None, force: bool = False) -> Path:
+    """
+    Retorna o path da capa do jogo, seguindo esta prioridade:
+      1. cover.png já presente na pasta do jogo  (override manual)
+      2. Baixa background_image da RAWG e salva em tmp/<slug>_cover.png
+    """
+    manual = cfg["_folder"] / "cover.png"
+    if manual.exists() and manual.stat().st_size > 0:
+        print(f"[cover] usando cover.png manual")
+        return manual
+
+    dest = TMP_DIR / f"{slug}_cover.png"
+
+    if rawg_details:
+        img_url = rawg_details.get("background_image")
+        if img_url:
+            if download_image(img_url, dest, force=force):
+                return dest
+
+    raise FileNotFoundError(
+        f"Nenhuma capa encontrada para '{slug}'.\n"
+        f"  → Coloque um cover.png em {cfg['_folder']}\n"
+        f"  → Ou configure RAWG_KEY no .env"
+    )
+
+
+def resolve_console(cfg: dict, force: bool = False) -> Path:
+    """
+    Retorna o path da imagem do console, seguindo esta prioridade:
+      1. console.png já presente na pasta do jogo  (override manual)
+      2. platforms/<platform_key>.png
+    """
+    manual = cfg["_folder"] / "console.png"
+    if manual.exists() and manual.stat().st_size > 0:
+        print(f"[console] usando console.png manual")
+        return manual
+
+    platform_key = cfg.get("platform_key", "")
+    if platform_key:
+        platform_img = PLATFORMS_DIR / f"{platform_key}.png"
+        if platform_img.exists() and platform_img.stat().st_size > 0:
+            print(f"[console] usando platforms/{platform_key}.png")
+            clean = platform_img.parent / f"{platform_key}_clean.png"
+            if not clean.exists() or force:
+                print(f"[console] removendo fundo branco...")
+                remove_white_background(platform_img, clean)
+            return clean
+        else:
+            raise FileNotFoundError(
+                f"Imagem do console não encontrada: {platform_img}\n"
+                f"  → Coloque a imagem do console em platforms/{platform_key}.png\n"
+                f"  → Ou coloque um console.png em {cfg['_folder']}"
+            )
+
+    raise FileNotFoundError(
+        f"Nenhuma imagem de console encontrada para '{cfg.get('slug')}'.\n"
+        f"  → Defina 'platform_key' no source.json (ex: 'playstation_1')\n"
+        f"  → E coloque a imagem em platforms/<platform_key>.png\n"
+        f"  → Ou coloque um console.png na pasta do jogo"
+    )
 
 
 # =========================
@@ -190,15 +296,15 @@ def rawg_game_details(game_id):
     return rawg_get_json(f"https://api.rawg.io/api/games/{game_id}", {"key": RAWG_KEY})
 
 
-def shorten(text, max_len=120):
+def shorten(text, max_len=80):
     text = re.sub(r"\s+", " ", text).strip()
     if len(text) <= max_len:
         return text
     return text[:max_len - 1].rstrip() + "…"
 
 
-def wrap_text(text: str, max_chars: int = 44) -> str:
-    """Quebra o texto em linhas de no máximo max_chars caracteres, respeitando palavras."""
+def wrap_text(text: str, max_chars: int = 44, max_lines: int = 2) -> str:
+    """Quebra o texto em no máximo max_lines linhas de max_chars caracteres."""
     words = text.split()
     lines, current = [], ""
     for word in words:
@@ -209,7 +315,9 @@ def wrap_text(text: str, max_chars: int = 44) -> str:
         else:
             lines.append(current)
             current = word
-    if current:
+        if len(lines) == max_lines:
+            break
+    if current and len(lines) < max_lines:
         lines.append(current)
     return "\n".join(lines)
 
@@ -227,7 +335,7 @@ def build_overlay_text(details, platform_label):
     desc_wrapped = wrap_text(f"Description: {desc_short}", max_chars=44)
 
     title_top = f"{name}  |  {platform_label}{(' • ' + year) if year else ''}"
-    # Plataforma e ano já aparecem no título — não repetir no corpo
+    # Platform and year already shown in title — not repeated in body
     body = (
         f"Developer: {dev}\n"
         f"Publisher: {pub}\n"
@@ -363,8 +471,8 @@ def render_vertical(slug, clip_path, cover_path, console_path, out_path,
 
         f"[2:v]scale={console_w}:{console_h}:force_original_aspect_ratio=decrease[console];"
 
-        f"[base][cover]overlay={cover_x}:{cover_y}[base2];"
-        f"[base2][console]overlay={console_x}:{console_y}[base3];"
+        f"[base][cover]overlay={cover_x}:{cover_y}:format=auto[base2];"
+        f"[base2][console]overlay={console_x}:{console_y}:format=auto[base3];"
 
         f"[base3]drawtext=textfile='{title_rel}':reload=1:x={title_x}:y={title_y}:"
         f"fontsize=44:fontcolor=white:shadowcolor=black:shadowx=2:shadowy=2:{title_box}{font_opt}[base4];"
@@ -396,20 +504,12 @@ def render_vertical(slug, clip_path, cover_path, console_path, out_path,
 # =========================
 def load_game_folder(game_folder: Path) -> dict:
     src_json = game_folder / "source.json"
-    cover    = game_folder / "cover.png"
-    console  = game_folder / "console.png"
 
     if not src_json.exists():
         raise FileNotFoundError(f"Faltou source.json em {game_folder}")
-    if not cover.exists() or cover.stat().st_size == 0:
-        raise FileNotFoundError(f"Faltou cover.png em {game_folder}")
-    if not console.exists() or console.stat().st_size == 0:
-        raise FileNotFoundError(f"Faltou console.png em {game_folder}")
 
     cfg = json.loads(src_json.read_text(encoding="utf-8"))
-    cfg["_folder"]  = game_folder
-    cfg["_cover"]   = cover
-    cfg["_console"] = console
+    cfg["_folder"] = game_folder
     return cfg
 
 
@@ -435,24 +535,29 @@ def main():
     rawg_query     = cfg.get("rawg_query") or cfg.get("slug") or slug
     clip_starts    = cfg.get("clip_starts")  # ex: ["00:05:00", "00:22:00", "00:45:00"]
 
-    # 1) RAWG metadata
-    title_top   = f"{slug.replace('_', ' ').title()}  |  {platform_label}"
-    body_bottom = f"Plataforma: {platform_label}"
+    # 1) RAWG metadata + capa
+    title_top    = f"{slug.replace('_', ' ').title()}  |  {platform_label}"
+    body_bottom  = f"Platform: {platform_label}"
+    rawg_details = None
 
     if RAWG_KEY:
         try:
             print("[rawg] buscando:", rawg_query)
-            first   = rawg_search_game(rawg_query)
-            details = rawg_game_details(first["id"])
-            title_top, body_bottom = build_overlay_text(details, platform_label)
+            first        = rawg_search_game(rawg_query)
+            rawg_details = rawg_game_details(first["id"])
+            title_top, body_bottom = build_overlay_text(rawg_details, platform_label)
         except Exception as e:
             print(f"[rawg] falhou ({type(e).__name__}): {e}")
             print("[rawg] seguindo com texto fallback…")
     else:
         print("[rawg] RAWG_KEY ausente — seguindo sem metadata.")
 
+    # 2) Resolve capa e console automaticamente
+    cover_path   = resolve_cover(cfg, slug, rawg_details, force=force)
+    console_path = resolve_console(cfg, force=force)
+
     # ============================================================
-    # 2) Download + corte — dois modos:
+    # 3) Download + corte — dois modos:
     #
     #  MODO A — clip_starts definido no source.json (recomendado)
     #    → baixa apenas 3 trechos curtos (~15s cada), ~5MB total
@@ -489,17 +594,17 @@ def main():
             ff_cut_clip(longplay_path, clip_i, start, CLIP_SECONDS, force=force)
             clips.append(clip_i)
 
-    # 3) Concat
+    # 4) Concat
     clip_path = TMP_DIR / f"{slug}_clip.mp4"
     ff_concat_3(clips, clip_path, force=force)
 
-    # 4) Render final
+    # 5) Render final
     out_path = OUT_DIR / f"{slug}.mp4"
     render_vertical(
         slug=slug,
         clip_path=clip_path,
-        cover_path=cfg["_cover"],
-        console_path=cfg["_console"],
+        cover_path=cover_path,
+        console_path=console_path,
         out_path=out_path,
         title_top=title_top,
         body_bottom=body_bottom,
