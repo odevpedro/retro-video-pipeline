@@ -15,9 +15,9 @@ from PIL import Image
 # =========================
 # Config
 # =========================
-TOTAL_SECONDS = 15
-CLIPS_COUNT = 3
-CLIP_SECONDS = TOTAL_SECONDS // CLIPS_COUNT  # 5s cada
+TOTAL_SECONDS = 66
+CLIPS_COUNT = 6
+CLIP_SECONDS = 11
 
 W, H = 1080, 1920
 TOP_PAD = 120
@@ -42,7 +42,9 @@ DOWNLOAD_SECTION_END = "00:25:00"
 MAX_HEIGHT = 720
 
 load_dotenv(ROOT / ".env")
-RAWG_KEY  = os.getenv("RAWG_KEY", "").strip()
+RAWG_KEY        = os.getenv("RAWG_KEY", "").strip()
+IGDB_CLIENT_ID  = os.getenv("IGDB_CLIENT_ID", "").strip()
+IGDB_CLIENT_SECRET = os.getenv("IGDB_CLIENT_SECRET", "").strip()
 FONT_FILE = os.getenv("FONT_FILE", "").strip()
 
 
@@ -140,32 +142,137 @@ def remove_white_background(src: Path, dst: Path, threshold: int = 240) -> Path:
     return dst
 
 
+
+# =========================
+# IGDB — box art oficial por plataforma
+# =========================
+
+# Mapa platform_label → ID numérico da plataforma no IGDB
+IGDB_PLATFORM_IDS = {
+    "playstation 1": 7,  "ps1": 7,  "psx": 7,
+    "playstation 2": 8,  "ps2": 8,
+    "playstation 3": 9,  "ps3": 9,
+    "nintendo entertainment system": 18, "nes": 18,
+    "super nintendo": 19, "snes": 19,
+    "nintendo 64": 4,    "n64": 4,
+    "gamecube": 21,
+    "sega mega drive": 29, "mega drive": 29, "genesis": 29,
+    "sega saturn": 32,   "saturn": 32,
+    "sega dreamcast": 23, "dreamcast": 23,
+    "game boy": 33,
+    "game boy color": 22,
+    "game boy advance": 24, "gba": 24,
+    "nintendo ds": 20,   "nds": 20,
+    "atari 2600": 59,
+}
+
+
+def igdb_get_token() -> str | None:
+    """Obtém token OAuth da Twitch para uso na IGDB."""
+    if not IGDB_CLIENT_ID or not IGDB_CLIENT_SECRET:
+        return None
+    try:
+        r = requests.post(
+            "https://id.twitch.tv/oauth2/token",
+            params={
+                "client_id": IGDB_CLIENT_ID,
+                "client_secret": IGDB_CLIENT_SECRET,
+                "grant_type": "client_credentials",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        return r.json().get("access_token")
+    except Exception as e:
+        print(f"[igdb] falhou ao obter token: {e}")
+        return None
+
+
+def igdb_fetch_cover(game_name: str, platform_label: str) -> str | None:
+    """
+    Busca a URL da capa oficial do jogo na IGDB filtrada por plataforma.
+    Retorna URL da imagem ou None.
+    """
+    token = igdb_get_token()
+    if not token:
+        return None
+
+    platform_id = IGDB_PLATFORM_IDS.get(platform_label.lower().strip())
+    headers = {
+        "Client-ID": IGDB_CLIENT_ID,
+        "Authorization": f"Bearer {token}",
+    }
+
+    try:
+        # Busca o jogo filtrando por plataforma se possível
+        platform_filter = f"& platforms = ({platform_id})" if platform_id else ""
+        game_query = f'search "{game_name}"; fields id,name; {platform_filter} limit 3;'
+        r = requests.post("https://api.igdb.com/v4/games",
+                          headers=headers, data=game_query, timeout=15)
+        r.raise_for_status()
+        games = r.json()
+        if not games:
+            return None
+
+        game_id = games[0]["id"]
+
+        # Busca a capa do jogo
+        cover_query = f"fields url; where game = {game_id}; limit 1;"
+        r = requests.post("https://api.igdb.com/v4/covers",
+                          headers=headers, data=cover_query, timeout=15)
+        r.raise_for_status()
+        covers = r.json()
+        if not covers:
+            return None
+
+        # Troca para resolução alta (t_cover_big = 264x374)
+        url = covers[0]["url"].replace("//", "https://").replace("t_thumb", "t_cover_big")
+        return url
+
+    except Exception as e:
+        print(f"[igdb] falhou ao buscar capa: {e}")
+        return None
+
+
 # =========================
 # Assets: capa e console
 # =========================
-def resolve_cover(cfg: dict, slug: str, rawg_details: dict | None, force: bool = False) -> Path:
+def resolve_cover(cfg: dict, slug: str, platform_label: str,
+                  rawg_details: dict | None, force: bool = False) -> Path:
     """
     Retorna o path da capa do jogo, seguindo esta prioridade:
-      1. cover.png já presente na pasta do jogo  (override manual)
-      2. Baixa background_image da RAWG e salva em tmp/<slug>_cover.png
+      1. cover.png manual na pasta do jogo
+      2. IGDB — capa oficial por plataforma (requer IGDB_CLIENT_ID + IGDB_CLIENT_SECRET)
+      3. RAWG — background_image (fallback)
     """
     manual = cfg["_folder"] / "cover.png"
     if manual.exists() and manual.stat().st_size > 0:
-        print(f"[cover] usando cover.png manual")
+        print("[cover] usando cover.png manual")
         return manual
 
     dest = TMP_DIR / f"{slug}_cover.png"
 
+    # Tenta IGDB primeiro (capa oficial da plataforma)
+    if IGDB_CLIENT_ID and IGDB_CLIENT_SECRET:
+        game_name = cfg.get("rawg_query") or slug.replace("_", " ")
+        print(f"[cover] buscando capa oficial no IGDB...")
+        img_url = igdb_fetch_cover(game_name, platform_label)
+        if img_url:
+            if download_image(img_url, dest, force=force):
+                return dest
+
+    # Fallback: RAWG background_image
     if rawg_details:
         img_url = rawg_details.get("background_image")
         if img_url:
+            print("[cover] usando background_image da RAWG (fallback)...")
             if download_image(img_url, dest, force=force):
                 return dest
 
     raise FileNotFoundError(
         f"Nenhuma capa encontrada para '{slug}'.\n"
         f"  → Coloque um cover.png em {cfg['_folder']}\n"
-        f"  → Ou configure RAWG_KEY no .env"
+        f"  → Ou configure IGDB_CLIENT_ID/IGDB_CLIENT_SECRET no .env"
     )
 
 
@@ -331,8 +438,12 @@ def build_overlay_text(details, platform_label):
     dev      = devs[0]["name"] if devs else "—"
     pub      = pubs[0]["name"] if pubs else "—"
     desc_raw = details.get("description_raw") or ""
-    desc_short   = shorten(desc_raw, 120) if desc_raw else "—"
-    desc_wrapped = wrap_text(f"Description: {desc_short}", max_chars=44)
+    desc_short   = shorten(desc_raw, 160) if desc_raw else "—"
+    desc_wrapped  = wrap_text(f"Description: {desc_short}", max_chars=44, max_lines=3)
+    # Garante que o texto nunca termine com pontuação solta
+    last_line = desc_wrapped.rstrip()
+    if last_line and last_line[-1] not in ".!?…":
+        desc_wrapped = desc_wrapped.rstrip().rstrip(",;: ") + "…"
 
     title_top = f"{name}  |  {platform_label}{(' • ' + year) if year else ''}"
     # Platform and year already shown in title — not repeated in body
@@ -355,6 +466,7 @@ def ff_cut_clip(src: Path, dst: Path, start_seconds: int, seconds: int, force: b
 
     start_ts = seconds_to_ts(start_seconds)
     run(["ffmpeg", "-y", "-ss", start_ts, "-t", str(seconds), "-i", str(src),
+         "-vf", "scale=960:720:force_original_aspect_ratio=decrease,pad=960:720:(ow-iw)/2:(oh-ih)/2,fps=30",
          "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
          "-c:a", "aac", "-b:a", "128k", str(dst)])
     print_size(dst, "clip")
@@ -365,35 +477,37 @@ def ff_cut_clip_from_start(src: Path, dst: Path, seconds: int, force: bool = Fal
     ff_cut_clip(src, dst, start_seconds=0, seconds=seconds, force=force)
 
 
-def pick_3_distinct_starts(dur, seconds):
+def pick_n_distinct_starts(dur, seconds, n=CLIPS_COUNT):
+    """Distribui n pontos de corte ao longo do vídeo evitando intro e créditos."""
     min_start = SAFE_START_PADDING
     max_start = max(min_start + 1, int(dur - SAFE_END_PADDING - seconds))
 
     if max_start <= min_start:
         base = max(0, int((dur - seconds) / 2))
-        return [base, base, base]
+        return [base] * n
 
-    span   = max_start - min_start
-    thirds = [min_start + int(span * 0.05),
-              min_start + int(span * 0.38),
-              min_start + int(span * 0.71)]
-    windows = [(thirds[0], min(thirds[0] + int(span * 0.18), max_start)),
-               (thirds[1], min(thirds[1] + int(span * 0.18), max_start)),
-               (thirds[2], min(thirds[2] + int(span * 0.18), max_start))]
+    span    = max_start - min_start
+    step    = span / n
+    window  = step * 0.4  # 40% do intervalo como janela aleatória
 
     starts = []
-    for a, b in windows:
-        starts.append(a if b <= a else random.randint(a, b))
+    for i in range(n):
+        center = min_start + int(step * (i + 0.3))
+        lo = center
+        hi = min(int(center + window), max_start)
+        starts.append(lo if hi <= lo else random.randint(lo, hi))
     return starts
 
 
-def ff_concat_3(clips: list[Path], out_path: Path, force: bool = False) -> None:
+def ff_concat_clips(clips: list[Path], out_path: Path, force: bool = False) -> None:
     if out_path.exists() and out_path.stat().st_size > 0 and not force:
         print(f"[skip] já existe: {out_path.name}")
         print_size(out_path, "concat")
         return
 
-    filter_complex = "[0:v][0:a][1:v][1:a][2:v][2:a]" + f"concat=n={len(clips)}:v=1:a=1[v][a]"
+    n = len(clips)
+    inputs_label = "".join(f"[{i}:v][{i}:a]" for i in range(n))
+    filter_complex = inputs_label + f"concat=n={n}:v=1:a=1[v][a]"
     cmd = ["ffmpeg", "-y"]
     for c in clips:
         cmd += ["-i", str(c)]
@@ -478,7 +592,7 @@ def render_vertical(slug, clip_path, cover_path, console_path, out_path,
         f"fontsize=44:fontcolor=white:shadowcolor=black:shadowx=2:shadowy=2:{title_box}{font_opt}[base4];"
 
         f"[base4]drawtext=textfile='{body_rel}':reload=1:x={body_x}:y={body_y}:"
-        f"fontsize=28:fontcolor=white:line_spacing=8:shadowcolor=black:shadowx=2:shadowy=2:{body_box}{font_opt}[v]"
+        f"fontsize=28:fontcolor=white:line_spacing=4:shadowcolor=black:shadowx=2:shadowy=2:{body_box}{font_opt}[v]"
     )
 
     run([
@@ -553,7 +667,7 @@ def main():
         print("[rawg] RAWG_KEY ausente — seguindo sem metadata.")
 
     # 2) Resolve capa e console automaticamente
-    cover_path   = resolve_cover(cfg, slug, rawg_details, force=force)
+    cover_path   = resolve_cover(cfg, slug, platform_label, rawg_details, force=force)
     console_path = resolve_console(cfg, force=force)
 
     # ============================================================
@@ -586,7 +700,7 @@ def main():
         yt_download_section(yt_url, longplay_path, DOWNLOAD_SECTION_START, DOWNLOAD_SECTION_END, force=force)
 
         dur    = ffprobe_duration_seconds(longplay_path)
-        starts = pick_3_distinct_starts(dur, CLIP_SECONDS)
+        starts = pick_n_distinct_starts(dur, CLIP_SECONDS)
 
         for idx, start in enumerate(starts, start=1):
             clip_i = TMP_DIR / f"{slug}_clip_{idx}.mp4"
@@ -596,7 +710,7 @@ def main():
 
     # 4) Concat
     clip_path = TMP_DIR / f"{slug}_clip.mp4"
-    ff_concat_3(clips, clip_path, force=force)
+    ff_concat_clips(clips, clip_path, force=force)
 
     # 5) Render final
     out_path = OUT_DIR / f"{slug}.mp4"

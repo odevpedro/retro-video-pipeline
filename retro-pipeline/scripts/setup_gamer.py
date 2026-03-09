@@ -43,12 +43,11 @@ LONGPLAY_CHANNELS = [
 ]
 
 # Quantos clips, duração de cada um
-CLIPS_COUNT   = 3
-CLIP_SECONDS  = 5
+CLIPS_COUNT   = 6
+CLIP_SECONDS  = 11
 
 # Pontos do vídeo a usar (% da duração total)
-# Pegamos trechos no início, meio e fim do gameplay
-CLIP_POSITIONS = [0.20, 0.50, 0.75]
+CLIP_POSITIONS = [0.12, 0.25, 0.40, 0.55, 0.68, 0.82]
 
 # Mapeia platform_label → platform_key (pasta em platforms/)
 PLATFORM_KEY_MAP = {
