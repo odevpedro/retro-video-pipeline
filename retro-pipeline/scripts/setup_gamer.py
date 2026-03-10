@@ -83,6 +83,8 @@ PLATFORM_KEY_MAP = {
     "nintendo ds":            "nintendo_ds",
     "nds":                    "nintendo_ds",
     "atari 2600":             "atari_2600",
+    "psp":                    "psp",
+    "playstation portable":   "psp",
 }
 
 

@@ -403,14 +403,7 @@ def rawg_game_details(game_id):
     return rawg_get_json(f"https://api.rawg.io/api/games/{game_id}", {"key": RAWG_KEY})
 
 
-def shorten(text, max_len=80):
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) <= max_len:
-        return text
-    return text[:max_len - 1].rstrip() + "…"
-
-
-def wrap_text(text: str, max_chars: int = 44, max_lines: int = 2) -> str:
+def wrap_text(text: str, max_chars: int = 44, max_lines: int = 3) -> str:
     """Quebra o texto em no máximo max_lines linhas de max_chars caracteres."""
     words = text.split()
     lines, current = [], ""
@@ -429,6 +422,71 @@ def wrap_text(text: str, max_chars: int = 44, max_lines: int = 2) -> str:
     return "\n".join(lines)
 
 
+def extract_description(text: str, max_chars: int = 44, max_lines: int = 3) -> str:
+    """
+    Extrai frases completas que caibam em max_lines linhas de max_chars cada.
+    - "Description: " ocupa 13 chars na primeira linha, reduzindo o espaço disponível
+    - Garante mínimo de 2 frases completas
+    - Nunca termina com pontuação incompleta (vírgula, ponto-e-vírgula, etc.)
+    """
+    text = re.sub(r"\s+", " ", text).strip()
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    if not sentences:
+        return "—"
+
+    # Budget real: primeira linha perde 13 chars por causa de "Description: "
+    prefix_len = len("Description: ")
+    budget = (max_chars - prefix_len) + (max_chars * (max_lines - 1))
+
+    def fits(candidate: str) -> bool:
+        """Verifica se o texto cabe nas linhas disponíveis."""
+        full = f"Description: {candidate}"
+        words = full.split()
+        lines, current = 0, ""
+        for word in words:
+            if not current:
+                current = word
+            elif len(current) + 1 + len(word) <= max_chars:
+                current += " " + word
+            else:
+                lines += 1
+                current = word
+                if lines >= max_lines:
+                    return False
+        return True
+
+    # Tenta acumular frases completas
+    chosen = []
+    for sentence in sentences:
+        candidate = " ".join(chosen + [sentence])
+        if fits(candidate):
+            chosen.append(sentence)
+        elif len(chosen) >= 2:
+            break
+        else:
+            # Menos de 2 frases — força inclusão truncando na última palavra inteira
+            words = sentence.split()
+            partial = " ".join(chosen) + " " if chosen else ""
+            for word in words:
+                test = (partial + word).strip()
+                if fits(test):
+                    partial = test + " "
+                else:
+                    break
+            result = partial.strip().rstrip(",;: ")
+            if not result.endswith((".", "!", "?")):
+                result += "…"
+            return result
+
+    result = " ".join(chosen)
+    # Garante que não termina com pontuação solta
+    result = result.rstrip(",;: ")
+    if result and not result[-1] in ".!?…":
+        result += "."
+    return result
+
+
 def build_overlay_text(details, platform_label):
     name     = details.get("name") or "Unknown"
     released = details.get("released") or ""
@@ -438,21 +496,13 @@ def build_overlay_text(details, platform_label):
     dev      = devs[0]["name"] if devs else "—"
     pub      = pubs[0]["name"] if pubs else "—"
     desc_raw = details.get("description_raw") or ""
-    desc_short   = shorten(desc_raw, 160) if desc_raw else "—"
-    desc_wrapped  = wrap_text(f"Description: {desc_short}", max_chars=44, max_lines=3)
-    # Garante que o texto nunca termine com pontuação solta
-    last_line = desc_wrapped.rstrip()
-    if last_line and last_line[-1] not in ".!?…":
-        desc_wrapped = desc_wrapped.rstrip().rstrip(",;: ") + "…"
+    desc_clean   = extract_description(desc_raw, max_chars=44, max_lines=3) if desc_raw else "—"
+    desc_wrapped = wrap_text(f"Description: {desc_clean}", max_chars=44, max_lines=3)
 
     title_top = f"{name}  |  {platform_label}{(' • ' + year) if year else ''}"
     # Platform and year already shown in title — not repeated in body
-    body = (
-        f"Developer: {dev}\n"
-        f"Publisher: {pub}\n"
-        f"{desc_wrapped}"
-    )
-    return title_top, body
+    info = f"Developer: {dev}\nPublisher: {pub}"
+    return title_top, info, desc_wrapped
 
 
 # =========================
@@ -522,23 +572,27 @@ def ff_concat_clips(clips: list[Path], out_path: Path, force: bool = False) -> N
 # Render final
 # =========================
 def write_text_file(path, content):
-    path.write_text(content, encoding="utf-8")
+    # Força LF (Unix) — o ffmpeg drawtext não lida bem com CRLF no Windows
+    path.write_bytes(content.replace("\r\n", "\n").encode("utf-8"))
 
 
 def render_vertical(slug, clip_path, cover_path, console_path, out_path,
-                    title_top, body_bottom, force=False):
+                    title_top, body_info, body_desc, force=False):
     if out_path.exists() and out_path.stat().st_size > 0 and not force:
         print(f"[skip] já existe: {out_path.name}")
         print_size(out_path, "output")
         return
 
     title_txt = TMP_DIR / f"{slug}_title.txt"
-    body_txt  = TMP_DIR / f"{slug}_body.txt"
+    info_txt  = TMP_DIR / f"{slug}_info.txt"
+    desc_txt  = TMP_DIR / f"{slug}_desc.txt"
     write_text_file(title_txt, title_top)
-    write_text_file(body_txt, body_bottom)
+    write_text_file(info_txt, body_info)
+    write_text_file(desc_txt, body_desc)
 
     title_rel = title_txt.relative_to(ROOT).as_posix()
-    body_rel  = body_txt.relative_to(ROOT).as_posix()
+    info_rel  = info_txt.relative_to(ROOT).as_posix()
+    desc_rel  = desc_txt.relative_to(ROOT).as_posix()
 
     font_opt = f":fontfile={FONT_FILE}" if FONT_FILE else ""
 
@@ -569,8 +623,12 @@ def render_vertical(slug, clip_path, cover_path, console_path, out_path,
     title_y = (TOP_PAD - 44) // 2       # ≈ 38
 
     # Texto no fundo do painel, abaixo das imagens
-    body_x = margin
-    body_y = img_center_y + max(cover_h, console_h) // 2 + 30   # ≈ 1730
+    body_x  = margin
+    # info: Developer + Publisher (2 linhas de 28px)
+    info_y  = img_center_y + max(cover_h, console_h) // 2 + 10   # ≈ 1710
+    # desc: começa após as 2 linhas de info + gap generoso
+    info_line_h = 28 + 10  # fontsize + line_spacing
+    desc_y  = info_y + 2 * info_line_h + 24                      # ≈ 1820
 
     title_box = "box=1:boxcolor=black@0.55:boxborderw=12"
     body_box  = "box=1:boxcolor=black@0.40:boxborderw=10"
@@ -591,8 +649,11 @@ def render_vertical(slug, clip_path, cover_path, console_path, out_path,
         f"[base3]drawtext=textfile='{title_rel}':reload=1:x={title_x}:y={title_y}:"
         f"fontsize=44:fontcolor=white:shadowcolor=black:shadowx=2:shadowy=2:{title_box}{font_opt}[base4];"
 
-        f"[base4]drawtext=textfile='{body_rel}':reload=1:x={body_x}:y={body_y}:"
-        f"fontsize=28:fontcolor=white:line_spacing=4:shadowcolor=black:shadowx=2:shadowy=2:{body_box}{font_opt}[v]"
+        f"[base4]drawtext=textfile='{info_rel}':reload=1:x={body_x}:y={info_y}:"
+        f"fontsize=28:fontcolor=white:line_spacing=10:shadowcolor=black:shadowx=2:shadowy=2:{body_box}{font_opt}[base5];"
+
+        f"[base5]drawtext=textfile='{desc_rel}':reload=1:x={body_x}:y={desc_y}:"
+        f"fontsize=22:fontcolor=white:line_spacing=8:shadowcolor=black:shadowx=2:shadowy=2:{body_box}{font_opt}[v]"
     )
 
     run([
@@ -659,7 +720,7 @@ def main():
             print("[rawg] buscando:", rawg_query)
             first        = rawg_search_game(rawg_query)
             rawg_details = rawg_game_details(first["id"])
-            title_top, body_bottom = build_overlay_text(rawg_details, platform_label)
+            title_top, body_info, body_desc = build_overlay_text(rawg_details, platform_label)
         except Exception as e:
             print(f"[rawg] falhou ({type(e).__name__}): {e}")
             print("[rawg] seguindo com texto fallback…")
@@ -721,7 +782,8 @@ def main():
         console_path=console_path,
         out_path=out_path,
         title_top=title_top,
-        body_bottom=body_bottom,
+        body_info=body_info,
+        body_desc=body_desc,
         force=force,
     )
 
